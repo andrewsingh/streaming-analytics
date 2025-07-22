@@ -3,3 +3,4 @@ dash-bootstrap-components==1.5.0
 plotly==5.17.0
 pandas==2.1.4
 tqdm==4.66.1 
+nbformat>=4.2.0

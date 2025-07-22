@@ -23,9 +23,17 @@ A modern, interactive web application for analyzing your Spotify Extended Stream
 - Python 3.7 or higher
 - Your Spotify Extended Streaming History data (downloaded from Spotify)
 
+## 📁 Getting Your Spotify Data
+1. Go to [Spotify Privacy Settings](https://www.spotify.com/account/privacy/) and make sure you are signed in
+2. Request your "Extended Streaming History" (not the basic account data)
+3. You’ll get an email from Spotify asking you to confirm the request. Open the email and click the link to confirm.
+5. Some time after confirming the request (usually a few hours, but can sometimes take longer), Spotify will send you another email saying that your extended streaming history is ready to download. Open this email and click the download link. This should download a `.zip` file called something like `my_spotify_data.zip` to your downloads.
+6. Once the download has completed, double-click the `.zip` file to uncompress it. You should now have a folder called `Spotify Extended Streaming History`.
+7. Use the path to this `Spotify Extended Streaming History` folder as the value for the `--data` argument when launching the dashboard.
+
 ### Installation
 
-1. **Clone or download the files**:
+1. **Clone the repository**:
    ```bash
    git clone https://github.com/andrewsingh/streaming-analytics.git
    cd streaming-analytics
@@ -36,7 +44,7 @@ A modern, interactive web application for analyzing your Spotify Extended Stream
    pip install -r requirements.txt
    ```
 
-3. **Run the dashboard**:
+3. **Run the dashboard with the path to your Spotify history**:
    ```bash
    python app.py --data "/path/to/your/Spotify Extended Streaming History"
    ```
@@ -54,13 +62,7 @@ python app.py --data "/path/to/your/Spotify Extended Streaming History" --port 8
 python app.py --data "/path/to/your/Spotify Extended Streaming History" --debug
 ```
 
-## 📁 Getting Your Spotify Data
 
-1. Go to [Spotify Privacy Settings](https://www.spotify.com/account/privacy/)
-2. Request your "Extended Streaming History" (not the basic account data)
-3. Wait for Spotify to email you the download link (can take up to 30 days)
-4. Download and extract the zip file
-6. Use the path to this `Spotify Extended Streaming History` folder as the value for the `--data` argument
 
 ## 🎛️ Interactive Controls
 
@@ -109,10 +111,6 @@ Once running, the dashboard will:
 - **Fall**: July - December
 - **Chronological Order**: F16 → S17 → F17 → S18 → F18 → etc.
 
-### Metrics
-- **Minutes Played**: Total listening time per artist/song
-- **Streaming Sessions**: Individual play events
-- **Date Range**: Covers your entire listening history
 
 ## 🛠️ Troubleshooting
 
@@ -120,13 +118,11 @@ Once running, the dashboard will:
 
 1. **"No data loaded" error**:
    - Verify the path to your Spotify data directory
-   - Ensure JSON files are in the `audio` subfolder
    - Check file permissions
 
 2. **Empty charts**:
    - Adjust the date range sliders
    - Ensure you have data for the selected time period
-   - Try reducing the number of top items
 
 3. **Port already in use**:
    - Use a different port: `--port 8051`
@@ -136,44 +132,7 @@ Once running, the dashboard will:
    - Manually navigate to `http://localhost:8050`
    - Check if your firewall is blocking the connection
 
-## 🔮 Future Enhancements
 
-- **📈 Listening Patterns**: Daily/weekly/monthly trends
-- **🎵 Genre Analysis**: Music taste evolution over time
-- **🌍 Discovery Analysis**: New vs. familiar music patterns
-- **📱 Platform Comparison**: Mobile vs. desktop listening habits
-- **🎯 Mood Tracking**: Energy levels and emotional patterns
-- **📊 Advanced Statistics**: Detailed listening metrics
-
-## 💡 Tips for Best Experience
-
-1. **Full Screen**: Use full-screen mode for better chart visibility
-2. **Hover Information**: Hover over chart elements for detailed information
-3. **Responsive Design**: Try different screen sizes and orientations
-4. **Data Range**: Experiment with different time ranges for insights
-5. **Sharing**: Use `--host 0.0.0.0` to share with others on your network
-
-## 📝 Technical Details
-
-- **Framework**: Dash (Plotly)
-- **Styling**: Bootstrap (Cyborg theme)
-- **Charts**: Plotly.js with dark theme
-- **Data Processing**: Pandas
-- **Color System**: Custom artist-based color wheel
-- **Architecture**: Multi-page application with modular design
-
-## 🤝 Contributing
-
-This dashboard is designed to be easily extensible. To add new visualizations:
-
-1. Create a new layout function
-2. Add navigation link in the sidebar
-3. Implement the corresponding callback
-4. Follow the existing dark theme patterns
-
-## 📄 License
-
-This project is open source and available under the MIT License.
 
 ---
 
