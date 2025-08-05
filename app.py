@@ -6,7 +6,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import plotly.io as pio
 import json
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from pathlib import Path
 import sys
 from datetime import datetime
@@ -14,9 +14,26 @@ from tqdm import tqdm
 import argparse
 import webbrowser
 from threading import Timer
+from rapidfuzz import process, fuzz
 
 # Set default plotly theme to dark
 pio.templates.default = "plotly_dark"
+
+# Constants for search and scoring
+SEARCH_CONSTANTS = {
+    'TRACK_WEIGHT': 1.0,
+    'ARTIST_WEIGHT': 0.8,
+    'ALBUM_WEIGHT': 0.6,
+    'COMBINED_WEIGHT': 0.7,
+    'DEFAULT_MIN_SCORE': 75,
+    'SEARCH_MIN_SCORE': 70,
+    'DEFAULT_SEARCH_LIMIT': 20,
+    'TOP_SONGS_LIMIT': 50,
+    'MAX_PLAY_BONUS': 5,
+    'PLAY_BONUS_DIVISOR': 1000,
+    'FLOAT_EPSILON': 1e-10,
+    'SEASON_FORMAT_THRESHOLD': 18
+}
 
 # Initialize Dash app with Bootstrap theme
 app = dash.Dash(__name__, 
@@ -28,6 +45,9 @@ app.title = "Spotify Analytics Dashboard"
 # Global variables for data
 df_global = None
 entries_global = None
+song_stats_global = None
+artist_rankings_global = None
+song_search_index = None
 
 def smart_convert_to_datetime(timestamp: int) -> datetime:
     """Convert timestamp to datetime, handling both seconds and milliseconds."""
@@ -91,6 +111,170 @@ def load_and_clean_entries(json_dir: str) -> List[Dict]:
     entries = clean_entries(entries)
     print(f"{len(entries)} entries after cleaning")
     return entries
+
+def precompute_artist_rankings(df: pd.DataFrame) -> Dict[str, Dict[str, int]]:
+    """Precompute artist rankings for different time periods."""
+    from datetime import datetime, timedelta
+    
+    now = datetime.now()
+    one_year_ago = now - timedelta(days=365)
+    six_months_ago = now - timedelta(days=180)
+    
+    # Calculate total minutes per artist for different time periods
+    df['minutes_played'] = df['ms_played'] / (1000 * 60)
+    
+    # All-time rankings
+    all_time_minutes = df.groupby('artist_name')['minutes_played'].sum().sort_values(ascending=False)
+    all_time_rankings = {artist: rank + 1 for rank, artist in enumerate(all_time_minutes.index)}
+    
+    # Past 1 year rankings
+    df_1yr = df[df['timestamp'] >= one_year_ago]
+    if len(df_1yr) > 0:
+        one_year_minutes = df_1yr.groupby('artist_name')['minutes_played'].sum().sort_values(ascending=False)
+        one_year_rankings = {artist: rank + 1 for rank, artist in enumerate(one_year_minutes.index)}
+    else:
+        one_year_rankings = {}
+    
+    # Past 6 months rankings
+    df_6mo = df[df['timestamp'] >= six_months_ago]
+    if len(df_6mo) > 0:
+        six_months_minutes = df_6mo.groupby('artist_name')['minutes_played'].sum().sort_values(ascending=False)
+        six_months_rankings = {artist: rank + 1 for rank, artist in enumerate(six_months_minutes.index)}
+    else:
+        six_months_rankings = {}
+    
+    return {
+        'all_time': all_time_rankings,
+        'past_1_year': one_year_rankings,
+        'past_6_months': six_months_rankings
+    }
+
+def precompute_song_stats(df: pd.DataFrame) -> Dict[tuple, Dict]:
+    """Precompute detailed statistics for all songs."""
+    print("Precomputing song statistics...")
+    
+    # Group by (track_name, artist_name) to merge duplicate songs with different URIs
+    df['minutes_played'] = df['ms_played'] / (1000 * 60)
+    df['listened_60s'] = df['ms_played'] >= 60000  # 60 seconds in milliseconds
+    
+    song_stats = {}
+    
+    # Group by song key
+    for (track_name, artist_name), group in tqdm(df.groupby(['track_name', 'artist_name']), desc="Processing songs"):
+        # Get album name (use the most common one if there are multiple)
+        album_name = group['album_name'].mode().iloc[0] if len(group['album_name'].mode()) > 0 else group['album_name'].iloc[0]
+        
+        # Calculate basic stats
+        stats = {
+            'track_name': track_name,
+            'artist_name': artist_name,
+            'album_name': album_name,
+            'first_streamed': group['timestamp'].min(),
+            'last_streamed': group['timestamp'].max(),
+            'total_streams': len(group),
+            'streams_60s': group['listened_60s'].sum(),
+            'total_minutes': group['minutes_played'].sum(),
+        }
+        
+        # Calculate seasonal streaming data with consistent format
+        # Determine format based on date range (same logic as other pages)
+        min_year = group['timestamp'].min().year
+        max_year = group['timestamp'].max().year
+        seasons_count = len(generate_seasons(min_year, max_year, short_format=True))
+        use_short_format = seasons_count > SEARCH_CONSTANTS['SEASON_FORMAT_THRESHOLD']
+        
+        group['season'] = group['timestamp'].apply(lambda x: get_season(x, short_format=use_short_format))
+        seasonal_minutes = group.groupby('season')['minutes_played'].sum()
+        stats['seasonal_data'] = seasonal_minutes.to_dict()
+        
+        song_stats[(track_name, artist_name)] = stats
+    
+    # Calculate percentile ranks
+    all_minutes = [stats['total_minutes'] for stats in song_stats.values()]
+    all_minutes_sorted = sorted(all_minutes)
+    
+    for song_key, stats in song_stats.items():
+        # Calculate percentile rank
+        song_minutes = stats['total_minutes']
+        rank = sum(1 for minutes in all_minutes_sorted if minutes < song_minutes)
+        percentile = (rank / len(all_minutes_sorted)) * 100
+        stats['percentile_rank'] = percentile
+    
+    print(f"✅ Precomputed statistics for {len(song_stats)} unique songs")
+    return song_stats
+
+def fuzzy_search_songs(query: str, search_index: Dict, song_stats: Dict, limit: int = None, min_score: int = None) -> List[Tuple[Tuple[str, str], float, str]]:
+    """
+    Perform weighted fuzzy search on songs with field-specific scoring.
+    
+    Args:
+        query: Search query string
+        search_index: Pre-built search index with individual fields
+        song_stats: Song statistics for additional ranking
+        limit: Maximum number of results to return
+        min_score: Minimum score threshold for matches
+    
+    Returns:
+        List of tuples: (song_key, weighted_score, match_type)
+    """
+    # Use default values from constants if not provided
+    if limit is None:
+        limit = SEARCH_CONSTANTS['DEFAULT_SEARCH_LIMIT']
+    if min_score is None:
+        min_score = SEARCH_CONSTANTS['DEFAULT_MIN_SCORE']
+        
+    if not query or not search_index:
+        return []
+    
+    results = []
+    query_lower = query.lower().strip()
+    
+    for song_key, fields in search_index.items():
+        if not fields:
+            continue
+            
+        try:
+            # Calculate weighted scores for each field using constants
+            track_score = fuzz.WRatio(query_lower, fields['track_name'].lower()) * SEARCH_CONSTANTS['TRACK_WEIGHT']
+            artist_score = fuzz.WRatio(query_lower, fields['artist_name'].lower()) * SEARCH_CONSTANTS['ARTIST_WEIGHT']
+            album_score = fuzz.WRatio(query_lower, fields['album_name'].lower()) * SEARCH_CONSTANTS['ALBUM_WEIGHT']
+            
+            # Also try combined search for cross-field matches
+            combined_score = fuzz.WRatio(query_lower, fields['combined'].lower()) * SEARCH_CONSTANTS['COMBINED_WEIGHT']
+            
+            # Take the best score across all fields
+            best_score = max(track_score, artist_score, album_score, combined_score)
+            
+            # Determine match type for better UX feedback (using epsilon for float comparison)
+            epsilon = SEARCH_CONSTANTS['FLOAT_EPSILON']
+            if abs(track_score - best_score) < epsilon:
+                match_type = "track"
+            elif abs(artist_score - best_score) < epsilon:
+                match_type = "artist"
+            elif abs(album_score - best_score) < epsilon:
+                match_type = "album"
+            else:
+                match_type = "combined"
+            
+            # Only include results above threshold
+            if best_score >= min_score:
+                # Add slight bonus for high-play-count songs to break ties intelligently
+                play_bonus = min(
+                    song_stats.get(song_key, {}).get('total_minutes', 0) / SEARCH_CONSTANTS['PLAY_BONUS_DIVISOR'], 
+                    SEARCH_CONSTANTS['MAX_PLAY_BONUS']
+                )
+                final_score = best_score + play_bonus
+                
+                results.append((song_key, final_score, match_type))
+                
+        except Exception as e:
+            # Skip problematic entries but don't crash the search
+            print(f"Warning: Error processing song {song_key}: {e}")
+            continue
+    
+    # Sort by score (descending) and limit results
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results[:limit]
 
 def assign_artist_colors(artists):
     """
@@ -226,6 +410,71 @@ def generate_seasons(start_year=2016, end_year=2025, short_format=False):
     
     return seasons
 
+def parse_season_for_sorting(season_str: str) -> tuple:
+    """
+    Parse season string and return tuple for chronological sorting.
+    Returns (year, season_order) where season_order is 0 for Spring, 1 for Fall.
+    """
+    try:
+        if '<br>' in season_str:
+            # Long format: "Spring<br>2023" or "Fall<br>2023"
+            season_type, year_str = season_str.split('<br>')
+            year = int(year_str)
+            season_order = 0 if season_type == 'Spring' else 1
+        else:
+            # Short format: "S23" or "F23"
+            season_type = season_str[0]
+            year_suffix = season_str[1:]
+            year = 2000 + int(year_suffix)  # Convert "23" to 2023
+            season_order = 0 if season_type == 'S' else 1
+        
+        return (year, season_order)
+    except:
+        # Fallback: return a high number to sort unknown formats last
+        return (9999, 9999)
+
+def generate_complete_season_range(first_date, last_date, short_format=False):
+    """
+    Generate all seasons between first and last date, inclusive.
+    """
+    first_season = get_season(first_date, short_format)
+    last_season = get_season(last_date, short_format)
+    
+    # Get the year range
+    start_year = first_date.year
+    end_year = last_date.year
+    
+    # Generate all possible seasons in this range
+    all_seasons = []
+    
+    for year in range(start_year, end_year + 1):
+        if short_format:
+            spring_season = f"S{year%100:02d}"
+            fall_season = f"F{year%100:02d}"
+        else:
+            spring_season = f"Spring<br>{year}"
+            fall_season = f"Fall<br>{year}"
+        
+        # Add spring season (Jan-June)
+        if year > start_year or first_date.month <= 6:
+            all_seasons.append(spring_season)
+        
+        # Add fall season (July-Dec)  
+        if year < end_year or last_date.month > 6:
+            all_seasons.append(fall_season)
+    
+    # Filter to only include seasons between first and last (inclusive)
+    first_sort_key = parse_season_for_sorting(first_season)
+    last_sort_key = parse_season_for_sorting(last_season)
+    
+    filtered_seasons = []
+    for season in all_seasons:
+        season_key = parse_season_for_sorting(season)
+        if first_sort_key <= season_key <= last_sort_key:
+            filtered_seasons.append(season)
+    
+    return filtered_seasons
+
 # CSS styling is now handled by assets/custom.css which Dash loads automatically
 
 # Navigation bar
@@ -249,6 +498,7 @@ sidebar = html.Div([
         dbc.NavLink("📈 Daily Streaming", href="/daily-streaming", active="exact", className="text-light"),
         dbc.NavLink("🎤 Top Artists", href="/top-artists", active="exact", className="text-light"),
         dbc.NavLink("🎵 Top Songs", href="/top-songs", active="exact", className="text-light"),
+        dbc.NavLink("🔍 Song Details", href="/song-details", active="exact", className="text-light"),
         dbc.NavLink("📊 Coming Soon...", href="/coming-soon", active="exact", className="text-light disabled"),
     ], vertical=True, pills=True)
 ], id="sidebar", style={
@@ -292,7 +542,7 @@ def overview_layout():
     date_range = f"{df_global['timestamp'].min().strftime('%Y-%m-%d')} to {df_global['timestamp'].max().strftime('%Y-%m-%d')}"
     
     return html.Div([
-        html.H1("🎵 Spotify Analytics Dashboard", className="mb-4"),
+        html.H2("🎵 Spotify Analytics Dashboard", className="mb-4"),
         html.P("Explore your music listening patterns through interactive visualizations.", 
                className="mb-4"),
         
@@ -334,12 +584,13 @@ def overview_layout():
         
         # Quick insights
         html.Div([
-            html.H3("🚀 Quick Start", className="text-light mb-3"),
+            html.H4("🚀 Quick Start", className="text-light mb-3"),
             html.P("Use the sidebar to navigate between different visualizations:"),
             html.Ul([
                 html.Li("📈 Daily Streaming - View your daily listening patterns with EMA smoothing"),
                 html.Li("🎤 Top Artists - See your favorite artists over time"),
                 html.Li("🎵 Top Songs - Explore individual tracks by season"),
+                html.Li("🔍 Song Details - Search for any song and view detailed streaming statistics"),
                 html.Li("📊 More visualizations coming soon!"),
             ])
         ])
@@ -356,7 +607,7 @@ def top_artists_layout():
     max_year = df_global['timestamp'].max().year
     
     return html.Div([
-        html.H1("🎤 Top Artists by Season", className="mb-4"),
+        html.H2("🎤 Top Artists by Season", className="mb-4"),
         
         # Controls
         dbc.Card([
@@ -408,7 +659,7 @@ def top_songs_layout():
     max_year = df_global['timestamp'].max().year
     
     return html.Div([
-        html.H1("🎵 Top Songs by Season", className="mb-4"),
+        html.H2("🎵 Top Songs by Season", className="mb-4"),
         
         # Controls
         dbc.Row([
@@ -460,7 +711,7 @@ def daily_streaming_layout():
     max_year = df_global['timestamp'].max().year
     
     return html.Div([
-        html.H1("📈 Daily Streaming Minutes", className="mb-4"),
+        html.H2("📈 Daily Streaming Minutes", className="mb-4"),
         html.P("Explore your daily listening patterns with exponential moving averages (EMA) to smooth out trends.", 
                className="mb-4"),
         
@@ -509,6 +760,47 @@ def daily_streaming_layout():
         html.Div(id="daily-stats", className="mt-4 stats-container")
     ])
 
+# Song Details Page
+def song_details_layout():
+    if df_global is None:
+        return html.Div([
+            dbc.Alert("No data loaded. Please run the app with --data argument.", color="danger")
+        ])
+    
+    if song_stats_global is None:
+        return html.Div([
+            dbc.Alert("Song statistics not loaded. Please restart the application.", color="danger")
+        ])
+        
+    return html.Div([
+        html.H2("🔍 Song Details", className="mb-4"),
+        html.P("Search for any song in your library to see detailed streaming statistics.", className="mb-4"),
+        
+        # Search section with improved fuzzy search
+        dbc.Card([
+            dbc.CardBody([
+                html.H4("🔎 Search for a Song", className="mb-3"),
+                html.P([
+                    "Search by song title, artist, or album name.",
+                    html.Br(),
+                    html.Small("Icons indicate match type: 🎵 song title, 🎤 artist name, 💿 album name, 🔍 multiple fields", className="text-muted")
+                ], className="mb-3"),
+                html.Label("Search your music library:"),
+                dcc.Dropdown(
+                    id="song-search-dropdown",
+                    placeholder="Try: 'drake hotline', 'bohemian rhap', 'taylor swift'...",
+                    options=[],  # Will be populated by callback
+                    value=None,
+                    searchable=True,
+                    className="mb-3"
+                ),
+            ])
+        ], className="mb-4"),
+        
+        # Song details section
+        html.Div(id="song-details-content")
+    ])
+
 # Callback for page routing
 @app.callback(Output("page-content", "children"), Input("url", "pathname"))
 def display_page(pathname):
@@ -518,9 +810,11 @@ def display_page(pathname):
         return top_artists_layout()
     elif pathname == "/top-songs":
         return top_songs_layout()
+    elif pathname == "/song-details":
+        return song_details_layout()
     elif pathname == "/coming-soon":
         return html.Div([
-            html.H1("🚧 Coming Soon!", className="text-light text-center"),
+            html.H2("🚧 Coming Soon!", className="text-light text-center"),
             html.P("More exciting visualizations are on the way!", className="text-light text-center")
         ])
     else:
@@ -999,8 +1293,347 @@ def update_daily_chart(ema_duration, date_range):
     
     return fig, stats
 
+# Callback to populate song search dropdown
+@app.callback(
+    Output("song-search-dropdown", "options"),
+    [Input("song-search-dropdown", "search_value"),
+     Input("song-search-dropdown", "value")]
+)
+def populate_song_dropdown(search_value, selected_value):
+    if song_stats_global is None or song_search_index is None:
+        return []
+    
+    all_songs = list(song_stats_global.keys())
+    
+    # If we have a selected value, we want to ensure it's in the options
+    # This helps maintain the selection after the user clicks
+    selected_song_key = None
+    if selected_value:
+        try:
+            parts = selected_value.split("|||")
+            if len(parts) == 2:
+                selected_song_key = (parts[0].strip(), parts[1].strip())
+        except:
+            pass
+    
+    # If no search value, return top songs by minutes
+    if not search_value:
+        top_songs = sorted(all_songs, key=lambda x: song_stats_global[x]['total_minutes'], reverse=True)[:SEARCH_CONSTANTS['TOP_SONGS_LIMIT']]
+        
+        # Ensure selected song is included if it exists and isn't already in top songs
+        if selected_song_key and selected_song_key not in top_songs:
+            top_songs = [selected_song_key] + top_songs[:-1]
+        
+        return [{"label": f"{track} - {artist}", "value": f"{track}|||{artist}"} 
+                for track, artist in top_songs]
+    
+    # Use improved weighted fuzzy search
+    try:
+        search_results = fuzzy_search_songs(
+            query=search_value,
+            search_index=song_search_index,
+            song_stats=song_stats_global,
+            limit=SEARCH_CONSTANTS['DEFAULT_SEARCH_LIMIT'],
+            min_score=SEARCH_CONSTANTS['SEARCH_MIN_SCORE']  # Slightly lower threshold for better recall
+        )
+        
+        # Convert results to dropdown options with match type indicators
+        options = []
+        result_keys = set()
+        
+        for song_key, score, match_type in search_results:
+            track, artist = song_key
+            result_keys.add(song_key)
+            
+            # Add subtle indicators for match type to help users understand why songs appear
+            match_indicator = {
+                'track': '🎵',
+                'artist': '🎤', 
+                'album': '💿',
+                'combined': '🔍'
+            }.get(match_type, '')
+            
+            label = f"{match_indicator} {track} - {artist}"
+            options.append({
+                "label": label,
+                "value": f"{track}|||{artist}"
+            })
+        
+        # Ensure selected song is included if it exists and isn't already in search results
+        if selected_song_key and selected_song_key not in result_keys and selected_song_key in all_songs:
+            track, artist = selected_song_key
+            options.insert(0, {
+                "label": f"✓ {track} - {artist}",  # Checkmark to show it's selected
+                "value": f"{track}|||{artist}"
+            })
+        
+        return options
+        
+    except Exception as e:
+        # Fallback to basic search if advanced search fails
+        print(f"Warning: Advanced search failed, using fallback: {e}")
+        search_lower = search_value.lower()
+        matching_songs = []
+        
+        for track, artist in all_songs:
+            track_safe = track or ''
+            artist_safe = artist or ''
+            if (search_lower in track_safe.lower() or search_lower in artist_safe.lower()):
+                matching_songs.append((track, artist))
+        
+        # Sort by total minutes and limit results
+        matching_songs = sorted(matching_songs, 
+                              key=lambda x: song_stats_global[x]['total_minutes'], 
+                              reverse=True)[:SEARCH_CONSTANTS['DEFAULT_SEARCH_LIMIT']]
+        
+        # Ensure selected song is included if it exists and isn't already in results
+        if selected_song_key and selected_song_key not in matching_songs and selected_song_key in all_songs:
+            matching_songs.insert(0, selected_song_key)
+            if len(matching_songs) > SEARCH_CONSTANTS['DEFAULT_SEARCH_LIMIT']:
+                matching_songs = matching_songs[:SEARCH_CONSTANTS['DEFAULT_SEARCH_LIMIT']]
+        
+        return [{"label": f"{track} - {artist}", "value": f"{track}|||{artist}"} 
+                for track, artist in matching_songs]
+
+# Callback to clear search when a selection is made (improves UX)
+@app.callback(
+    Output("song-search-dropdown", "search_value"),
+    Input("song-search-dropdown", "value"),
+    prevent_initial_call=True
+)
+def clear_search_on_selection(selected_value):
+    """Clear search input when user selects a song to improve UX."""
+    if selected_value:
+        return ""  # Clear the search value
+    return dash.no_update
+
+# Callback for song details display
+@app.callback(
+    Output("song-details-content", "children"),
+    Input("song-search-dropdown", "value")
+)
+def display_song_details(selected_song):
+    if not selected_song or song_stats_global is None or artist_rankings_global is None:
+        return html.Div([
+            dbc.Card([
+                dbc.CardBody([
+                    html.H4("Select a song to view detailed statistics", className="text-center text-muted"),
+                    html.P("Use the dropdown above to search for and select a song from your library.", className="text-center text-muted")
+                ])
+            ])
+        ])
+    
+    # Parse the selected song with proper validation
+    try:
+        # Validate input format
+        if not isinstance(selected_song, str) or "|||" not in selected_song:
+            return html.Div([dbc.Alert("Invalid song selection format.", color="danger")])
+        
+        parts = selected_song.split("|||")
+        if len(parts) != 2:
+            return html.Div([dbc.Alert("Invalid song selection format - expected track|||artist.", color="danger")])
+        
+        track_name, artist_name = parts
+        
+        # Validate that parts are not empty
+        if not track_name.strip() or not artist_name.strip():
+            return html.Div([dbc.Alert("Invalid song selection - empty track or artist name.", color="danger")])
+        
+        song_key = (track_name.strip(), artist_name.strip())
+        
+    except Exception as e:
+        return html.Div([dbc.Alert(f"Error parsing selected song: {str(e)}", color="danger")])
+    
+    if song_key not in song_stats_global:
+        return html.Div([dbc.Alert("Song not found in statistics. Please try searching again.", color="warning")])
+    
+    stats = song_stats_global[song_key]
+    
+    # Get artist rankings
+    artist_rank_all_time = artist_rankings_global['all_time'].get(artist_name, "N/A")
+    artist_rank_1yr = artist_rankings_global['past_1_year'].get(artist_name, "N/A")
+    artist_rank_6mo = artist_rankings_global['past_6_months'].get(artist_name, "N/A")
+    
+    # Create seasonal histogram with proper chronological ordering and missing seasons
+    seasonal_data = stats.get('seasonal_data', {})
+    first_streamed = stats.get('first_streamed')
+    last_streamed = stats.get('last_streamed')
+    
+    # Only create chart if we have valid streaming dates
+    if first_streamed and last_streamed and seasonal_data:
+        # Determine the season format used (consistent with how data was stored)
+        sample_season = list(seasonal_data.keys())[0] if seasonal_data else None
+        use_short_format = sample_season and '<br>' not in sample_season
+        
+        # Generate complete chronological season range between first and last stream
+        complete_seasons = generate_complete_season_range(
+            first_streamed, 
+            last_streamed, 
+            short_format=use_short_format
+        )
+        
+        # Fill in missing seasons with 0 minutes
+        complete_data = []
+        for season in complete_seasons:
+            minutes = seasonal_data.get(season, 0.0)  # Default to 0 if season not in data
+            complete_data.append((season, minutes))
+        
+        # Sort chronologically using our parsing function
+        complete_data.sort(key=lambda x: parse_season_for_sorting(x[0]))
+        
+        # Extract sorted seasons and minutes
+        seasons = [item[0] for item in complete_data]
+        minutes = [item[1] for item in complete_data]
+        
+        # Create the figure
+        fig = go.Figure(data=[
+            go.Bar(
+                x=seasons,
+                y=minutes,
+                marker_color='#FF6B6B',
+                hovertemplate='<b>%{x}</b><br>Minutes: %{y:.1f}<extra></extra>'
+            )
+        ])
+        
+        fig.update_layout(
+            title={
+                'text': f"Streaming History by Season",
+                'x': 0.5,
+                'xanchor': 'center',
+                'font': {'size': 16}
+            },
+            xaxis_title="Season",
+            yaxis_title="Minutes Streamed",
+            height=400,
+            template='plotly_dark',
+            plot_bgcolor='#0e1117',
+            paper_bgcolor='#0e1117',
+            xaxis=dict(
+                tickangle=45 if len(seasons) > 6 else 0,  # Rotate labels if many seasons
+                type='category'  # Ensure categorical ordering is preserved
+            )
+        )
+        
+        seasonal_chart = dcc.Graph(figure=fig)
+    else:
+        # More informative message based on data state
+        if not seasonal_data:
+            message = "No seasonal streaming data available for this song."
+        elif not first_streamed or not last_streamed:
+            message = "Invalid streaming date information for this song."
+        else:
+            message = "No streaming activity recorded for this song across any season."
+        seasonal_chart = dbc.Alert(message, color="info")
+    
+    return html.Div([
+        # Song header
+        dbc.Card([
+            dbc.CardBody([
+                html.H3(f"🎵 {stats['track_name']}", className="mb-2"),
+                html.H5(f"by {stats['artist_name']}", className="text-muted mb-2"),
+                html.H6(f"Album: {stats['album_name']}", className="text-muted")
+            ])
+        ], className="mb-4"),
+        
+        # Basic stats cards
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardBody([
+                        html.H4(stats['first_streamed'].strftime('%Y-%m-%d'), className="text-primary"),
+                        html.P("First Streamed", className="text-light")
+                    ])
+                ], className="custom-card text-center")
+            ], width=3),
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardBody([
+                        html.H4(stats['last_streamed'].strftime('%Y-%m-%d'), className="text-primary"),
+                        html.P("Last Streamed", className="text-light")
+                    ])
+                ], className="custom-card text-center")
+            ], width=3),
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardBody([
+                        html.H4(f"{stats['total_streams']:,}", className="text-primary"),
+                        html.P("Total Streams", className="text-light")
+                    ])
+                ], className="custom-card text-center")
+            ], width=3),
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardBody([
+                        html.H4(f"{stats['streams_60s']:,}", className="text-primary"),
+                        html.P("Streams (60s+)", className="text-light")
+                    ])
+                ], className="custom-card text-center")
+            ], width=3),
+        ], className="mb-4"),
+        
+        # More stats
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardBody([
+                        html.H4(f"{stats['total_minutes']:,.1f}", className="text-primary"),
+                        html.P("Total Minutes", className="text-light")
+                    ])
+                ], className="custom-card text-center")
+            ], width=4),
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardBody([
+                        html.H4(f"{stats['percentile_rank']:.1f}%", className="text-primary"),
+                        html.P("Percentile Rank", className="text-light"),
+                    ])
+                ], className="custom-card text-center")
+            ], width=4),
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardBody([
+                        html.H4(f"{stats['total_minutes']/stats['total_streams']:.1f}" if stats['total_streams'] > 0 else "0.0", className="text-primary"),
+                        html.P("Avg Minutes/Stream", className="text-light")
+                    ])
+                ], className="custom-card text-center")
+            ], width=4),
+        ], className="mb-4"),
+        
+        # Artist rankings
+        dbc.Card([
+            dbc.CardBody([
+                html.H5("🎤 Artist Rankings", className="mb-3"),
+                dbc.Row([
+                    dbc.Col([
+                        html.H5(f"#{artist_rank_all_time}" if isinstance(artist_rank_all_time, int) else str(artist_rank_all_time), 
+                               className="text-primary text-center"),
+                        html.P("All-Time Rank", className="text-center")
+                    ], width=4),
+                    dbc.Col([
+                        html.H5(f"#{artist_rank_1yr}" if isinstance(artist_rank_1yr, int) else str(artist_rank_1yr), 
+                               className="text-primary text-center"),
+                        html.P("Past 1 Year Rank", className="text-center")
+                    ], width=4),
+                    dbc.Col([
+                        html.H5(f"#{artist_rank_6mo}" if isinstance(artist_rank_6mo, int) else str(artist_rank_6mo), 
+                               className="text-primary text-center"),
+                        html.P("Past 6 Months Rank", className="text-center")
+                    ], width=4),
+                ])
+            ])
+        ], className="mb-4"),
+        
+        # Seasonal chart
+        dbc.Card([
+            dbc.CardBody([
+                html.H5("📊 Streaming History by Season", className="mb-3"),
+                seasonal_chart
+            ])
+        ])
+    ])
+
 def main():
-    global df_global, entries_global
+    global df_global, entries_global, song_stats_global, artist_rankings_global, song_search_index
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Spotify Analytics Dashboard")
@@ -1022,6 +1655,32 @@ def main():
         df_global['timestamp'] = pd.to_datetime(df_global['timestamp'])
         df_global['date'] = df_global['timestamp'].dt.date
         print(f"✅ Data loaded successfully! {len(df_global)} records from {df_global['timestamp'].min()} to {df_global['timestamp'].max()}")
+        
+        # Precompute song statistics and artist rankings
+        print("Precomputing analytics...")
+        artist_rankings_global = precompute_artist_rankings(df_global.copy())
+        song_stats_global = precompute_song_stats(df_global.copy())
+        
+        # Pre-build song search index with proper structure and null safety
+        print("Building search index...")
+        song_search_index = {}
+        for key, stats in song_stats_global.items():
+            # Handle potential None values and create structured search text
+            track_name = stats.get('track_name') or ''
+            artist_name = stats.get('artist_name') or ''
+            album_name = stats.get('album_name') or ''
+            
+            # Store individual fields for weighted search
+            song_search_index[key] = {
+                'track_name': track_name,
+                'artist_name': artist_name,
+                'album_name': album_name,
+                'combined': f"TRACK:{track_name} ARTIST:{artist_name} ALBUM:{album_name}"
+            }
+        print(f"✅ Search index built for {len(song_search_index)} songs!")
+        
+        print("✅ Analytics precomputation complete!")
+        
     except Exception as e:
         print(f"❌ Error loading data: {e}")
         sys.exit(1)
