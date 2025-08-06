@@ -112,41 +112,70 @@ def load_and_clean_entries(json_dir: str) -> List[Dict]:
     print(f"{len(entries)} entries after cleaning")
     return entries
 
-def precompute_artist_rankings(df: pd.DataFrame) -> Dict[str, Dict[str, int]]:
-    """Precompute artist rankings for different time periods."""
+def precompute_artist_rankings(df: pd.DataFrame) -> Dict[str, Dict[str, any]]:
+    """Precompute artist rankings and minutes data for different time periods."""
     from datetime import datetime, timedelta
     
     now = datetime.now()
     one_year_ago = now - timedelta(days=365)
     six_months_ago = now - timedelta(days=180)
+    one_month_ago = now - timedelta(days=30)
     
     # Calculate total minutes per artist for different time periods
     df['minutes_played'] = df['ms_played'] / (1000 * 60)
     
-    # All-time rankings
+    # All-time data
     all_time_minutes = df.groupby('artist_name')['minutes_played'].sum().sort_values(ascending=False)
     all_time_rankings = {artist: rank + 1 for rank, artist in enumerate(all_time_minutes.index)}
+    all_time_minutes_dict = all_time_minutes.to_dict()
     
-    # Past 1 year rankings
+    # Past 1 year data
     df_1yr = df[df['timestamp'] >= one_year_ago]
     if len(df_1yr) > 0:
         one_year_minutes = df_1yr.groupby('artist_name')['minutes_played'].sum().sort_values(ascending=False)
         one_year_rankings = {artist: rank + 1 for rank, artist in enumerate(one_year_minutes.index)}
+        one_year_minutes_dict = one_year_minutes.to_dict()
     else:
         one_year_rankings = {}
+        one_year_minutes_dict = {}
     
-    # Past 6 months rankings
+    # Past 6 months data
     df_6mo = df[df['timestamp'] >= six_months_ago]
     if len(df_6mo) > 0:
         six_months_minutes = df_6mo.groupby('artist_name')['minutes_played'].sum().sort_values(ascending=False)
         six_months_rankings = {artist: rank + 1 for rank, artist in enumerate(six_months_minutes.index)}
+        six_months_minutes_dict = six_months_minutes.to_dict()
     else:
         six_months_rankings = {}
+        six_months_minutes_dict = {}
+    
+    # Past 1 month data
+    df_1mo = df[df['timestamp'] >= one_month_ago]
+    if len(df_1mo) > 0:
+        one_month_minutes = df_1mo.groupby('artist_name')['minutes_played'].sum().sort_values(ascending=False)
+        one_month_rankings = {artist: rank + 1 for rank, artist in enumerate(one_month_minutes.index)}
+        one_month_minutes_dict = one_month_minutes.to_dict()
+    else:
+        one_month_rankings = {}
+        one_month_minutes_dict = {}
     
     return {
-        'all_time': all_time_rankings,
-        'past_1_year': one_year_rankings,
-        'past_6_months': six_months_rankings
+        'all_time': {
+            'rankings': all_time_rankings,
+            'minutes': all_time_minutes_dict
+        },
+        'past_1_year': {
+            'rankings': one_year_rankings,
+            'minutes': one_year_minutes_dict
+        },
+        'past_6_months': {
+            'rankings': six_months_rankings,
+            'minutes': six_months_minutes_dict
+        },
+        'past_1_month': {
+            'rankings': one_month_rankings,
+            'minutes': one_month_minutes_dict
+        }
     }
 
 def precompute_song_stats(df: pd.DataFrame) -> Dict[tuple, Dict]:
@@ -498,6 +527,7 @@ sidebar = html.Div([
         dbc.NavLink("📈 Daily Streaming", href="/daily-streaming", active="exact", className="text-light"),
         dbc.NavLink("🎤 Top Artists", href="/top-artists", active="exact", className="text-light"),
         dbc.NavLink("🎵 Top Songs", href="/top-songs", active="exact", className="text-light"),
+        dbc.NavLink("👑 Artists by Minutes", href="/artists-by-minutes", active="exact", className="text-light"),
         dbc.NavLink("🔍 Song Details", href="/song-details", active="exact", className="text-light"),
         dbc.NavLink("📊 Coming Soon...", href="/coming-soon", active="exact", className="text-light disabled"),
     ], vertical=True, pills=True)
@@ -590,6 +620,7 @@ def overview_layout():
                 html.Li("📈 Daily Streaming - View your daily listening patterns with EMA smoothing"),
                 html.Li("🎤 Top Artists - See your favorite artists over time"),
                 html.Li("🎵 Top Songs - Explore individual tracks by season"),
+                html.Li("👑 Artists by Minutes - Rankings and charts of your top artists by listening time"),
                 html.Li("🔍 Song Details - Search for any song and view detailed streaming statistics"),
                 html.Li("📊 More visualizations coming soon!"),
             ])
@@ -801,6 +832,52 @@ def song_details_layout():
         html.Div(id="song-details-content")
     ])
 
+# Artists by Minutes Page
+def artists_by_minutes_layout():
+    if df_global is None:
+        return html.Div([
+            dbc.Alert("No data loaded. Please run the app with --data argument.", color="danger")
+        ])
+    
+    if artist_rankings_global is None:
+        return html.Div([
+            dbc.Alert("Artist statistics not loaded. Please restart the application.", color="danger")
+        ])
+        
+    return html.Div([
+        html.H2("👑 Top Artists by Minutes Streamed", className="mb-4"),
+        html.P("View your top artists ranked by total listening time across different periods.", className="mb-4"),
+        
+        # Time period selector
+        dbc.Card([
+            dbc.CardBody([
+                html.Label("Select Time Period:", className="mb-3"),
+                dbc.RadioItems(
+                    id="time-period-selector",
+                    options=[
+                        {"label": "All Time", "value": "all_time"},
+                        {"label": "Past 1 Year", "value": "past_1_year"},
+                        {"label": "Past 6 Months", "value": "past_6_months"},
+                        {"label": "Past 1 Month", "value": "past_1_month"}
+                    ],
+                    value="all_time",
+                    inline=True,
+                    className="mb-3"
+                )
+            ])
+        ], className="mb-4"),
+        
+        # Chart and table will be populated by callback
+        dcc.Loading(
+            id="loading-artists-by-minutes",
+            type="circle",
+            children=[
+                html.Div(id="artists-chart-container"),
+                html.Div(id="artists-table-container", className="mt-4")
+            ]
+        )
+    ])
+
 # Callback for page routing
 @app.callback(Output("page-content", "children"), Input("url", "pathname"))
 def display_page(pathname):
@@ -810,6 +887,8 @@ def display_page(pathname):
         return top_artists_layout()
     elif pathname == "/top-songs":
         return top_songs_layout()
+    elif pathname == "/artists-by-minutes":
+        return artists_by_minutes_layout()
     elif pathname == "/song-details":
         return song_details_layout()
     elif pathname == "/coming-soon":
@@ -1253,6 +1332,14 @@ def update_daily_chart(ema_duration, date_range):
         
         title_text = f"Daily Spotify Minutes Streamed ({ema_span}-day EMA)"
     
+    # Calculate a reasonable Y-axis maximum based on 99th percentile to avoid outlier compression
+    # This gives the main trend lines more vertical room to be visible
+    percentile_99 = plot_df['minutes'].quantile(0.99)
+    # Round up to the next 100-minute interval
+    y_max = int((percentile_99 // 100 + 1) * 100)
+    # Ensure minimum of 200 for very low-usage cases
+    y_max = max(y_max, 200)
+    
     # Update layout
     fig.update_layout(
         title={
@@ -1269,6 +1356,7 @@ def update_daily_chart(ema_duration, date_range):
         showlegend=True,
         legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01),
         xaxis=dict(rangeslider=dict(visible=True)),
+        yaxis=dict(range=[0, y_max]),  # Set calculated Y-axis range to avoid outlier compression
         plot_bgcolor='#0e1117',
         paper_bgcolor='#0e1117',
     )
@@ -1289,6 +1377,11 @@ def update_daily_chart(ema_duration, date_range):
         html.P(f"Average minutes per day: {avg_minutes:.1f}"),
         html.P(f"Peak listening day: {max_minutes:.0f} minutes"),
         html.P(f"EMA smoothing: {'None' if ema_span is None else f'{ema_span} days'}"),
+        html.Hr(),
+        html.P(f"Chart Y-axis max: {y_max} min (99th percentile: {percentile_99:.0f} min)", 
+               className="text-muted small"),
+        html.P("Y-axis optimized to show trend details by excluding extreme outliers", 
+               className="text-muted small"),
     ])
     
     return fig, stats
@@ -1450,9 +1543,10 @@ def display_song_details(selected_song):
     stats = song_stats_global[song_key]
     
     # Get artist rankings
-    artist_rank_all_time = artist_rankings_global['all_time'].get(artist_name, "N/A")
-    artist_rank_1yr = artist_rankings_global['past_1_year'].get(artist_name, "N/A")
-    artist_rank_6mo = artist_rankings_global['past_6_months'].get(artist_name, "N/A")
+    artist_rank_all_time = artist_rankings_global['all_time']['rankings'].get(artist_name, "N/A")
+    artist_rank_1yr = artist_rankings_global['past_1_year']['rankings'].get(artist_name, "N/A")
+    artist_rank_6mo = artist_rankings_global['past_6_months']['rankings'].get(artist_name, "N/A")
+    artist_rank_1mo = artist_rankings_global['past_1_month']['rankings'].get(artist_name, "N/A")
     
     # Create seasonal histogram with proper chronological ordering and missing seasons
     seasonal_data = stats.get('seasonal_data', {})
@@ -1608,17 +1702,22 @@ def display_song_details(selected_song):
                         html.H5(f"#{artist_rank_all_time}" if isinstance(artist_rank_all_time, int) else str(artist_rank_all_time), 
                                className="text-primary text-center"),
                         html.P("All-Time Rank", className="text-center")
-                    ], width=4),
+                    ], width=3),
                     dbc.Col([
                         html.H5(f"#{artist_rank_1yr}" if isinstance(artist_rank_1yr, int) else str(artist_rank_1yr), 
                                className="text-primary text-center"),
                         html.P("Past 1 Year Rank", className="text-center")
-                    ], width=4),
+                    ], width=3),
                     dbc.Col([
                         html.H5(f"#{artist_rank_6mo}" if isinstance(artist_rank_6mo, int) else str(artist_rank_6mo), 
                                className="text-primary text-center"),
                         html.P("Past 6 Months Rank", className="text-center")
-                    ], width=4),
+                    ], width=3),
+                    dbc.Col([
+                        html.H5(f"#{artist_rank_1mo}" if isinstance(artist_rank_1mo, int) else str(artist_rank_1mo), 
+                               className="text-primary text-center"),
+                        html.P("Past 1 Month Rank", className="text-center")
+                    ], width=3),
                 ])
             ])
         ], className="mb-4"),
@@ -1631,6 +1730,121 @@ def display_song_details(selected_song):
             ])
         ])
     ])
+
+# Callback for artists by minutes page
+@app.callback(
+    [Output("artists-chart-container", "children"),
+     Output("artists-table-container", "children")],
+    Input("time-period-selector", "value")
+)
+def update_artists_by_minutes(time_period):
+    if artist_rankings_global is None:
+        return html.Div(), html.Div()
+    
+    # Get the data for the selected time period
+    period_data = artist_rankings_global.get(time_period, {})
+    minutes_data = period_data.get('minutes', {})
+    
+    if not minutes_data:
+        no_data_message = dbc.Alert(f"No data available for {time_period.replace('_', ' ').title()}.", color="warning")
+        return no_data_message, html.Div()
+    
+    # Sort artists by minutes (highest to lowest)
+    sorted_artists = sorted(minutes_data.items(), key=lambda x: x[1], reverse=True)
+    
+    # Limit to top 25 artists for better visualization
+    top_artists = sorted_artists[:25]
+    
+    if not top_artists:
+        return html.Div(), html.Div()
+    
+    # Prepare data for the chart
+    artist_names = [artist for artist, _ in top_artists]
+    minutes_values = [minutes for _, minutes in top_artists]
+    
+    # Get artist colors for consistent styling (use all artists for consistent color assignment)
+    all_artists_in_data = list(minutes_data.keys())
+    artist_colors_map = assign_artist_colors(all_artists_in_data)
+    bar_colors = [artist_colors_map.get(artist, '#FF6B6B') for artist in artist_names]
+    
+    # Create horizontal bar chart
+    fig = go.Figure(data=[
+        go.Bar(
+            x=minutes_values,
+            y=artist_names,
+            orientation='h',
+            marker_color=bar_colors,
+            hovertemplate='<b>%{y}</b><br>Minutes: %{x:,.1f}<br>Hours: %{customdata:.1f}<extra></extra>',
+            customdata=[m/60 for m in minutes_values]  # Convert to hours for hover
+        )
+    ])
+    
+    # Update layout for horizontal bar chart
+    fig.update_layout(
+        title={
+            'text': f"Top Artists by Minutes Streamed - {time_period.replace('_', ' ').title()}",
+            'x': 0.5,
+            'xanchor': 'center',
+            'font': {'size': 18}
+        },
+        xaxis_title="Minutes Streamed",
+        yaxis_title="Artists",
+        height=max(600, len(top_artists) * 25 + 100),  # Dynamic height based on number of artists
+        template='plotly_dark',
+        plot_bgcolor='#0e1117',
+        paper_bgcolor='#0e1117',
+        yaxis=dict(autorange='reversed'),  # Show highest at top
+        margin=dict(l=150)  # More left margin for artist names
+    )
+    
+    chart = dcc.Graph(figure=fig)
+    
+    # Create table data
+    table_data = []
+    for i, (artist, minutes) in enumerate(top_artists, 1):
+        hours = minutes / 60
+        table_data.append({
+            'rank': i,
+            'artist': artist,
+            'minutes': f"{minutes:,.1f}",
+            'hours': f"{hours:.1f}"
+        })
+    
+    # Create table
+    table = dbc.Table([
+        html.Thead([
+            html.Tr([
+                html.Th("Rank", style={"width": "10%"}),
+                html.Th("Artist", style={"width": "50%"}),
+                html.Th("Minutes", style={"width": "20%"}),
+                html.Th("Hours", style={"width": "20%"})
+            ])
+        ]),
+        html.Tbody([
+            html.Tr([
+                html.Td(row['rank'], className="text-center"),
+                html.Td(row['artist']),
+                html.Td(row['minutes'], className="text-end"),
+                html.Td(row['hours'], className="text-end")
+            ]) for row in table_data
+        ])
+    ], 
+    striped=True, 
+    bordered=True, 
+    hover=True,
+    responsive=True,
+    className="mt-3",
+    style={"backgroundColor": "#1a252f"})
+    
+    # Wrap table in a card
+    table_card = dbc.Card([
+        dbc.CardBody([
+            html.H5(f"📊 Top Artists Data - {time_period.replace('_', ' ').title()}", className="mb-3"),
+            table
+        ])
+    ])
+    
+    return chart, table_card
 
 def main():
     global df_global, entries_global, song_stats_global, artist_rankings_global, song_search_index
