@@ -48,6 +48,9 @@ entries_global = None
 song_stats_global = None
 artist_rankings_global = None
 song_search_index = None
+artist_list_global = None
+artist_total_minutes_global = None
+artist_daily_minutes_global = None
 
 def smart_convert_to_datetime(timestamp: int) -> datetime:
     """Convert timestamp to datetime, handling both seconds and milliseconds."""
@@ -305,6 +308,22 @@ def fuzzy_search_songs(query: str, search_index: Dict, song_stats: Dict, limit: 
     results.sort(key=lambda x: x[1], reverse=True)
     return results[:limit]
 
+def fuzzy_search_artists(query: str, artists: List[str], limit: int = 20, min_score: int = 70) -> List[Tuple[str, float]]:
+    """Simple fuzzy search for artist names using RapidFuzz WRatio."""
+    if not query:
+        return []
+    q = query.lower().strip()
+    results: List[Tuple[str, float]] = []
+    for artist in artists:
+        try:
+            score = fuzz.WRatio(q, (artist or '').lower())
+            if score >= min_score:
+                results.append((artist, score))
+        except Exception:
+            continue
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results[:limit]
+
 def assign_artist_colors(artists):
     """
     Assign colors to artists based on their musical mood/tone using a color wheel approach.
@@ -528,6 +547,7 @@ sidebar = html.Div([
         dbc.NavLink("🎤 Top Artists", href="/top-artists", active="exact", className="text-light"),
         dbc.NavLink("🎵 Top Songs", href="/top-songs", active="exact", className="text-light"),
         dbc.NavLink("👑 Artists by Minutes", href="/artists-by-minutes", active="exact", className="text-light"),
+        dbc.NavLink("⏱️ Artist Cumulative", href="/artist-cumulative", active="exact", className="text-light"),
         dbc.NavLink("🔍 Song Details", href="/song-details", active="exact", className="text-light"),
         dbc.NavLink("📊 Coming Soon...", href="/coming-soon", active="exact", className="text-light disabled"),
     ], vertical=True, pills=True)
@@ -878,6 +898,73 @@ def artists_by_minutes_layout():
         )
     ])
 
+# Artist Cumulative Page
+def artist_cumulative_layout():
+    if df_global is None:
+        return html.Div([
+            dbc.Alert("No data loaded. Please run the app with --data argument.", color="danger")
+        ])
+    # Date bounds for picker
+    min_date = df_global['date'].min()
+    max_date = df_global['date'].max()
+    return html.Div([
+        html.H2("⏱️ Cumulative Minutes by Artist", className="mb-4"),
+        html.P("Add artists to compare cumulative minutes listened over time. Use the list to show/hide or remove artists.", className="mb-4"),
+        dcc.Store(id="selected-artists-store", data={"selected": [], "visible": []}),
+        dbc.Card([
+            dbc.CardBody([
+                html.Label("Search and add an artist:"),
+                dcc.Dropdown(
+                    id="artist-search-dropdown",
+                    placeholder="Type an artist name (e.g., 'dua', 'cole', 'drake')",
+                    options=[],
+                    value=None,
+                    searchable=True,
+                    className="mb-3"
+                )
+            ])
+        ], className="mb-3"),
+        dbc.Card([
+            dbc.CardBody([
+                html.Label("Start date (x-axis):"),
+                dcc.DatePickerSingle(
+                    id="artist-cum-start-date",
+                    min_date_allowed=min_date,
+                    max_date_allowed=max_date,
+                    date=min_date,
+                    display_format='YYYY-MM-DD',
+                    className="mb-2"
+                ),
+                html.Div(
+                    html.Small(f"Data range: {min_date} to {max_date}", className="text-muted"),
+                    className="text-muted"
+                )
+            ])
+        ], className="mb-3"),
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardBody([
+                        html.H5("Artists in Graph", className="mb-3"),
+                        dcc.Checklist(id="artist-visibility-checklist", options=[], value=[], className="mb-3"),
+                        dbc.ButtonGroup([
+                            dbc.Button("Show All", id="btn-show-all-artists", size="sm", color="secondary"),
+                            dbc.Button("Hide All", id="btn-hide-all-artists", size="sm", color="secondary"),
+                            dbc.Button("Remove Hidden", id="btn-remove-hidden-artists", size="sm", color="danger")
+                        ])
+                    ])
+                ])
+            ], width=4),
+            dbc.Col([
+                dcc.Loading(
+                    id="loading-artist-cum",
+                    type="circle",
+                    children=dcc.Graph(id="artist-cumulative-graph", style={"height": "650px"})
+                )
+            ], width=8)
+        ])
+    ])
+
 # Callback for page routing
 @app.callback(Output("page-content", "children"), Input("url", "pathname"))
 def display_page(pathname):
@@ -889,6 +976,8 @@ def display_page(pathname):
         return top_songs_layout()
     elif pathname == "/artists-by-minutes":
         return artists_by_minutes_layout()
+    elif pathname == "/artist-cumulative":
+        return artist_cumulative_layout()
     elif pathname == "/song-details":
         return song_details_layout()
     elif pathname == "/coming-soon":
@@ -1846,8 +1935,136 @@ def update_artists_by_minutes(time_period):
     
     return chart, table_card
 
+# ===== Artist Cumulative Page Callbacks =====
+@app.callback(
+    Output("artist-search-dropdown", "options"),
+    [Input("artist-search-dropdown", "search_value"),
+     Input("artist-search-dropdown", "value")]
+)
+def populate_artist_search(search_value, selected_value):
+    if artist_list_global is None:
+        return []
+    # Default list: top by minutes
+    if not search_value:
+        top = artist_total_minutes_global.head(30).index.tolist() if artist_total_minutes_global is not None else artist_list_global[:30]
+        if selected_value and selected_value not in top:
+            top = [selected_value] + top[:-1]
+        return [{"label": a, "value": a} for a in top]
+    results = fuzzy_search_artists(search_value, artist_list_global, limit=20, min_score=SEARCH_CONSTANTS['SEARCH_MIN_SCORE'])
+    options = [{"label": a, "value": a} for a, _ in results]
+    if selected_value and selected_value not in [o['value'] for o in options] and selected_value in artist_list_global:
+        options.insert(0, {"label": f"✓ {selected_value}", "value": selected_value})
+    return options
+
+@app.callback(
+    Output("selected-artists-store", "data"),
+    [Input("artist-search-dropdown", "value"),
+     Input("btn-show-all-artists", "n_clicks"),
+     Input("btn-hide-all-artists", "n_clicks"),
+     Input("btn-remove-hidden-artists", "n_clicks"),
+     Input("artist-visibility-checklist", "value")],
+    [State("selected-artists-store", "data")],
+    prevent_initial_call=True
+)
+def update_selected_artists(new_selection, show_all_clicks, hide_all_clicks, remove_hidden_clicks, visible_checked, store):
+    store = store or {"selected": [], "visible": []}
+    selected = list(store.get("selected", []))
+    visible = list(store.get("visible", []))
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return store
+    trigger = ctx.triggered[0]['prop_id']
+    if trigger.startswith("artist-search-dropdown") and new_selection:
+        if new_selection not in selected:
+            selected.append(new_selection)
+            # Make newly added artist visible by default
+            if new_selection not in visible:
+                visible.append(new_selection)
+        return {"selected": selected, "visible": visible}
+    if trigger.startswith("artist-visibility-checklist"):
+        return {"selected": selected, "visible": visible_checked or []}
+    if trigger.startswith("btn-show-all-artists"):
+        return {"selected": selected, "visible": selected}
+    if trigger.startswith("btn-hide-all-artists"):
+        return {"selected": selected, "visible": []}
+    if trigger.startswith("btn-remove-hidden-artists"):
+        remaining = [a for a in selected if a in visible]
+        return {"selected": remaining, "visible": remaining}
+    return store
+
+@app.callback(
+    Output("artist-visibility-checklist", "options"),
+    Output("artist-visibility-checklist", "value"),
+    Input("selected-artists-store", "data")
+)
+def render_artist_checklist(store):
+    store = store or {"selected": [], "visible": []}
+    options = [{"label": a, "value": a} for a in store.get("selected", [])]
+    value = store.get("visible", []) or store.get("selected", [])
+    return options, value
+
+@app.callback(
+    Output("artist-cumulative-graph", "figure"),
+    [Input("selected-artists-store", "data"),
+     Input("artist-cum-start-date", "date")]
+)
+def render_artist_cumulative_graph(store, start_date):
+    if artist_daily_minutes_global is None:
+        return go.Figure()
+    store = store or {"selected": [], "visible": []}
+    selected = store.get("selected", [])
+    visible = set(store.get("visible", []))
+    fig = go.Figure()
+    if not selected:
+        fig.update_layout(template='plotly_dark', plot_bgcolor='#0e1117', paper_bgcolor='#0e1117',
+                          title={"text": "Add artists to view cumulative minutes over time", "x": 0.5, "xanchor": "center"})
+        return fig
+    # Build cumulative per artist
+    dates = sorted(artist_daily_minutes_global['date'].unique())
+    if start_date:
+        # Filter dates to start from selected date
+        dates = [d for d in dates if pd.to_datetime(d) >= pd.to_datetime(start_date)]
+    # Color mapping based on existing scheme for consistency
+    artist_colors = assign_artist_colors(selected)
+    for artist in selected:
+        df_a = artist_daily_minutes_global[artist_daily_minutes_global['artist_name'] == artist]
+        if df_a.empty:
+            continue
+        # Apply start-date filter to the artist data as well to avoid index reintroduction
+        if start_date:
+            df_a = df_a[pd.to_datetime(df_a['date']) >= pd.to_datetime(start_date)]
+        series = pd.Series(0.0, index=pd.to_datetime(dates))
+        series.loc[pd.to_datetime(df_a['date'])] = df_a['minutes_played'].values
+        cumulative = series.sort_index().cumsum()
+        fig.add_trace(go.Scatter(
+            x=cumulative.index,
+            y=cumulative.values,
+            mode='lines',
+            name=artist,
+            line=dict(color=artist_colors.get(artist, '#FF6B6B'), width=2),
+            visible=True if artist in visible else 'legendonly',
+        ))
+    fig.update_layout(
+        title={
+            'text': 'Cumulative Minutes Listened by Artist',
+            'x': 0.5,
+            'xanchor': 'center',
+            'font': {'size': 18}
+        },
+        xaxis_title='Date',
+        yaxis_title='Cumulative Minutes',
+        template='plotly_dark',
+        height=650,
+        hovermode='x unified',
+        plot_bgcolor='#0e1117',
+        paper_bgcolor='#0e1117',
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='left', x=0)
+    )
+    return fig
+
 def main():
     global df_global, entries_global, song_stats_global, artist_rankings_global, song_search_index
+    global artist_list_global, artist_total_minutes_global, artist_daily_minutes_global
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Spotify Analytics Dashboard")
@@ -1893,6 +2110,26 @@ def main():
             }
         print(f"✅ Search index built for {len(song_search_index)} songs!")
         
+        # Precompute artist lists and daily/cumulative structures for the cumulative page
+        print("Preparing artist cumulative data...")
+        artist_list_global = sorted(df_global['artist_name'].dropna().unique().tolist())
+        # Daily minutes per artist (for cumulative build)
+        tmp = df_global.copy()
+        tmp['minutes_played'] = tmp['ms_played'] / (1000 * 60)
+        artist_daily_minutes_global = (
+            tmp.groupby(['date', 'artist_name'])['minutes_played']
+               .sum()
+               .reset_index()
+               .sort_values('date')
+        )
+        # Total minutes per artist (for default suggestions)
+        artist_total_minutes_global = (
+            tmp.groupby('artist_name')['minutes_played']
+               .sum()
+               .sort_values(ascending=False)
+        )
+        print("✅ Artist cumulative data prepared!")
+
         print("✅ Analytics precomputation complete!")
         
     except Exception as e:
